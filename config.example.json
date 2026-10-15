@@ -1,5 +1,6 @@
 {
   "port": 3123,
+  "extraPorts": [],
   "apiKey": "",
   "proxyKey": "",
   "publicBaseUrl": "",

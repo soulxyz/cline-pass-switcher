@@ -1,6 +1,9 @@
 # 密钥与运行数据 —— 绝不要提交到仓库
 config.json
 metadata.json
+models-dev-pricing.json
+models-dev-pricing.json.tmp
+*.log
 data/
 _testenv/
 

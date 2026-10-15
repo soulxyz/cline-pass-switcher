@@ -1,15 +1,17 @@
 // Cline Pass 上游观察/切换代理
 // 零依赖，Node >= 18。
 //
-// 网关行为（实测结论，README 有证据）：
-// - 订阅模型（cline-pass/*）与非 free 目录模型：请求体里的 provider.* 会被 Cline 网关丢弃，
-//   由其规划器在系统凭证上游中自行挑选，响应元数据可回读实际上游。
-// - 目录模型 :free 变体：provider.only 真正透传到 OpenRouter，可精确钉住。
+// 直连管道使用 provider，规划器管道使用 providerOptions.gateway。
+// 模型的管道类型与可用渠道由探测结果决定。
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { Readable, Transform } from 'node:stream';
+import { Readable, Transform, pipeline } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { StreamObserver, normalizeUsage, addAggregate, accumulateCacheUsage, accumulateCostUsage, addDimension } from './lib/telemetry.js';
+import { normalizePricing, priceEntry } from './lib/costs.js';
+import { createModelsDevStore } from './lib/models-dev.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || __dirname;
@@ -19,6 +21,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const DEFAULT_CONFIG = {
   port: 3123,
+  extraPorts: [],
   apiKey: '',
   proxyKey: '',
   publicBaseUrl: '',
@@ -50,6 +53,8 @@ const DEFAULT_CONFIG = {
   // 全部失败才把最后一个错误透传给客户端；exclude 中的上游永不被使用（自动模式下注入排除偏好）。
   // upstream 为旧版单上游兼容镜像（取列表第一个），maxRetries 已退役（旧值仅作回滚兼容保留在文件里）。
   perModel: {},
+  pricing: {},
+  pricingSources: {},
 };
 
 function loadJson(file, fallback) {
@@ -63,6 +68,35 @@ const config = { ...DEFAULT_CONFIG, ...loadJson(CONFIG_PATH, {}) };
 const META = loadJson(META_PATH, { models: {}, history: [], catalog: null, orModelsFetchedAt: 0, orModelList: null });
 const saveConfig = () => fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 const saveMeta = () => fs.writeFileSync(META_PATH, JSON.stringify(META, null, 2));
+const modelPrices = createModelsDevStore(path.join(DATA_DIR, 'models-dev-pricing.json'));
+const ACTIVE = new Map();
+let LAST_MEASURED = META.lastMeasured || META.history.find(entry => typeof entry.tps === 'number' && Number.isFinite(entry.tps) && !entry.error && !(entry.status >= 400)) || null;
+// Seed only once from retained history; legacy requests have unknown token usage.
+if (!META.analytics) {
+  META.analytics = { since: Date.now(), cacheVersion: 1, detailVersion: 1, days: {}, hours: {} };
+  for (const entry of [...META.history].reverse()) addAggregate(META.analytics, entry);
+}
+// Enrich existing aggregates from retained history without resetting old totals.
+if (META.analytics.cacheVersion !== 1) {
+  for (const entry of META.history) {
+    const iso = new Date(entry.ts).toISOString();
+    for (const [group, key] of [['days', iso.slice(0, 10)], ['hours', iso.slice(0, 13)]]) {
+      const bucket = META.analytics[group][key];
+      if (bucket) accumulateCacheUsage(bucket, entry);
+    }
+  }
+  META.analytics.cacheVersion = 1;
+}
+if (META.analytics.detailVersion !== 1) {
+  for (const entry of META.history) {
+    const iso = new Date(entry.ts).toISOString();
+    for (const [group, key] of [['days', iso.slice(0, 10)], ['hours', iso.slice(0, 13)]]) {
+      const bucket = META.analytics[group][key];
+      if (bucket) { accumulateCostUsage(bucket, entry); addDimension(bucket, entry); }
+    }
+  }
+  META.analytics.detailVersion = 1;
+}
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
   config.accounts = [{ name: '默认账号', key: config.apiKey, enabled: true }];
@@ -95,6 +129,11 @@ if (process.env.CLINE_PASS_KEY) {
 if (process.env.PROXY_KEY && process.env.PROXY_KEY.trim()) config.proxyKey = process.env.PROXY_KEY.trim();
 if (process.env.PUBLIC_BASE_URL) config.publicBaseUrl = process.env.PUBLIC_BASE_URL.trim();
 if (process.env.PORT) config.port = Number(process.env.PORT) || config.port;
+// 备用端口：EXTRA_PORTS=18123,18124 追加到 config.extraPorts（不覆盖配置文件里的值）
+if (process.env.EXTRA_PORTS) {
+  const envPorts = process.env.EXTRA_PORTS.split(',').map((s) => Number(s.trim())).filter(Boolean);
+  if (envPorts.length) config.extraPorts = [...new Set([...(config.extraPorts || []), ...envPorts])];
+}
 
 function isConfigured() {
   return !!config.apiKey || enabledAccounts().length > 0;
@@ -138,10 +177,10 @@ function authOK(req) {
 function unauthorized(res) {
   return sendJSON(res, 401, { error: { message: 'unauthorized: 代理密钥缺失或错误', type: 'auth_error' } });
 }
-function publicProxyBase() {
+function publicProxyBase(req) {
   return config.publicBaseUrl
     ? `${config.publicBaseUrl.replace(/\/+$/, '')}/v1`
-    : `http://127.0.0.1:${config.port}/v1`;
+    : `http://127.0.0.1:${req?.socket.localPort || config.port}/v1`;
 }
 
 const OR_API = 'https://openrouter.ai/api/v1';
@@ -413,9 +452,20 @@ async function fetchOfficialModels() {
 }
 
 function record(modelId, info) {
+  const entryForPrice = { model: modelId, ...info };
+  info = { ...info, ...priceEntry(entryForPrice, config.pricing, modelPrices.lookup(entryForPrice, config.pricingSources?.[modelId])) };
+  void modelPrices.refresh();
   META.models[modelId] = { ...(META.models[modelId] || {}), ...info };
-  META.history.unshift({ ts: Date.now(), model: modelId, ...info });
-  if (META.history.length > 100) META.history.length = 100;
+  if (info.provider) META.models[modelId].lastProvider = info.provider;
+  if (info.ms != null) META.models[modelId].lastMs = info.ms;
+  const entry = { ts: Date.now(), model: modelId, id: randomUUID(), ...info };
+  META.history.unshift(entry);
+  if (typeof entry.tps === 'number' && Number.isFinite(entry.tps) && !entry.error && !(entry.status >= 400)) {
+    LAST_MEASURED = entry;
+    META.lastMeasured = entry;
+  }
+  if (META.history.length > 2000) META.history.length = 2000;
+  addAggregate(META.analytics, entry);
   if (info.account) {
     META.stats = META.stats || {};
     const st = (META.stats[info.account] ||= { requests: 0, lastUsed: 0, lastError: null });
@@ -539,7 +589,7 @@ async function attemptOnce(modelId, body, attempt, signal) {
     const json = await res.json().catch(() => null);
     if (!json) return { status: 502, out: { error: { message: 'upstream returned non-JSON', type: 'upstream_error' } }, routing: {}, netError: 'non-JSON response', acc };
     const { status, body: out, routing } = unwrap(json);
-    return { status, out, routing, netError: null, acc };
+    return { status: res.ok ? status : res.status, out: !res.ok && !out?.error ? { error: { message: `upstream HTTP ${res.status}`, type: 'upstream_error' } } : out, routing, netError: null, acc };
   } catch (e) {
     return { status: 502, out: { error: { message: `upstream fetch failed: ${e.message}`, type: 'upstream_error' } }, routing: {}, netError: e.message, acc };
   }
@@ -557,7 +607,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   let activeCtrl = null;            // 当前尝试的 AbortController；流式成功后保持指向该次 fetch，用于断连时中止上游 body
   let keepCloseHook = false;        // 流式 SSE 建立后，close 钩子要保留到流结束
   const onClientClose = () => { if (activeCtrl) activeCtrl.abort(); };
-  req.on('close', onClientClose);
+  req.socket.on('close', onClientClose);
   try {
     for (const attempt of attempts) {
       const t1 = Date.now();
@@ -567,6 +617,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       try {
         if (stream) {
           const send = injectPrefs(body, modelId, attempt);
+          send.stream_options = { ...send.stream_options, include_usage: true };
           const acc = pickAccount();
           let up = null;
           let netError = null;
@@ -582,16 +633,26 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
             let reader = null;
             try {
               reader = up.body.getReader();
-              const { value, done } = await reader.read();
+              let { value, done } = await reader.read();
+              // SSE lines can span network chunks; wait for one line before classifying.
+              if (!done) {
+                let prefix = Buffer.from(value);
+                while (!prefix.includes(10) && prefix.length < 4096) {
+                  const next = await reader.read();
+                  if (next.done) break;
+                  prefix = Buffer.concat([prefix, Buffer.from(next.value)]);
+                }
+                value = prefix;
+              }
               if (done) {
                 isSSE = false;
                 netError = 'empty stream';
               } else {
                 firstChunk = Buffer.from(value);
                 const head = firstChunk.toString('utf8').trimStart().slice(0, 200);
-                if (head.startsWith('data:')) {
+                if (/^(data:|:|event:|id:|retry:)/.test(head)) {
                   const payload = head.replace(/^data:\s*/, '').slice(0, 160);
-                  if (payload.startsWith('{"error"')) { isSSE = false; netError = `stream error: ${payload.slice(0, 120)}`; }
+                  if (/^\{\s*"error"\s*:/.test(payload)) { isSSE = false; netError = `stream error: ${payload.slice(0, 120)}`; }
                 } else {
                   isSSE = false;
                   netError = `unexpected stream head: ${head.slice(0, 60)}`;
@@ -616,11 +677,12 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
               text = await up.text();
             }
             try { json = JSON.parse(text); } catch {}
-            const msg = errText(json?.error) || text.slice(0, 160) || netError;
-            trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
+            const msg = errText(json?.error) || text.slice(0, 160) || netError || 'empty upstream response';
+            const errorStatus = up.status >= 400 ? up.status : 502;
+            trace.push({ upstream: attempt.upstream, status: errorStatus, ms, note: msg.slice(0, 160) });
             if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
             if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
-            last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
+            last = { status: errorStatus, out: json?.error ? (unwrap(json).body) : { error: { message: msg.slice(0, 400), type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
             continue; // 错误：还未向客户端写任何字节，可切换下一候选
           }
           if (!up) {
@@ -631,7 +693,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
           keepCloseHook = true;
           trace.push({ upstream: attempt.upstream, status: 200, ms, note: 'stream' });
-          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
+          return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0, abort: onClientClose };
         }
         // 非流式
         const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
@@ -647,7 +709,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
       }
     }
   } finally {
-    if (!keepCloseHook) req.off('close', onClientClose);
+    if (!keepCloseHook) req.socket.off('close', onClientClose);
   }
   return { ...last, status: last?.status ?? 502, trace, t0, netError: last?.netError || null };
 }
@@ -663,13 +725,23 @@ async function handleChat(req, res) {
   const targets = buildAttempts(modelId, cfg).map((a) => a.upstream).filter(Boolean);
   const isStream = !!body.stream;
 
-  const chain = await runChatChain(req, body, modelId, cfg, { stream: isStream });
+  const id = randomUUID();
+  const startedAt = Date.now();
+  const live = { id, model: modelId, startedAt, stream: isStream, targets };
+  ACTIVE.set(id, live);
+  let chain;
+  try {
+    chain = await runChatChain(req, body, modelId, cfg, { stream: isStream });
+  } catch (e) {
+    ACTIVE.delete(id);
+    record(modelId, { id, startedAt, ms: Date.now() - startedAt, status: 502, stream: isStream, error: e.message, ...normalizeUsage(null) });
+    throw e;
+  }
 
   if (isStream && chain.streamUp) {
     // 流式透传：先写已探测的首块，再接剩余 body；tap 在结束时回读路由元数据并记录
     const up = chain.streamUp;
     const acc = chain.acc;
-    const t0 = chain.t0;
     const ctype = up.headers.get('content-type') || 'text/event-stream';
     res.writeHead(up.status, {
       'Content-Type': ctype,
@@ -679,54 +751,64 @@ async function handleChat(req, res) {
       'X-Cline-Target-Upstream': targets.length ? targets.join('>') : 'auto',
       'X-Cline-Attempts': String(chain.trace.length),
       'X-Cline-Account': headerSafe(acc.name),
+      'X-Request-Id': id,
     });
-    if (chain.streamHead) res.write(chain.streamHead);
-    const buf = [];
+    const observer = new StreamObserver(startedAt);
+    live.observer = observer;
+    live.account = acc.name;
+    live.trace = chain.trace;
+    if (chain.streamHead) { observer.push(chain.streamHead); res.write(chain.streamHead); }
+    const onResponseClose = () => { if (!res.writableFinished) chain.abort(); };
+    res.on('close', onResponseClose);
     const tap = new Transform({
-      transform(c, enc, cb) { buf.push(c); cb(null, c); },
-      flush(cb) {
-        const text = Buffer.concat(buf).toString('utf8');
-        let provider = null, canonical = null;
-        // direct 管道：最后一个 chunk 顶层带 provider（显示名）与 model
-        const lines = text.split('\n');
-        for (let i = lines.length - 1; i >= 0 && i >= lines.length - 10 && !provider; i--) {
-          const l = lines[i];
-          if (!l.startsWith('data: ') || l.includes('[DONE]')) continue;
-          try {
-            const c = JSON.parse(l.slice(6));
-            if (typeof c.provider === 'string') { provider = slugify(c.provider); canonical = c.model || null; }
-          } catch { /* 跳过不完整行 */ }
-        }
-        // planner 管道：final chunk 的 provider_metadata.gateway.routing
-        if (!provider) {
-          const fp = /"finalProvider":"([^"]+)"/.exec(text);
-          const cs = /"canonicalSlug":"([^"]+)"/.exec(text);
-          provider = fp ? fp[1] : null;
-          canonical = cs ? cs[1] : null;
-        }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto') });
-        cb();
-      },
+      transform(c, enc, cb) { observer.push(c); cb(null, c); },
     });
-    Readable.fromWeb(up.body).pipe(tap).pipe(res);
+    // 用 pipeline 透传：上游中途断连（ECONNRESET / other side closed）或客户端断开触发 abort 时，
+    // 错误会被 pipeline 捕获并销毁两端流，而不会以未处理的 'error' 事件让进程崩溃。
+    const src = Readable.fromWeb(up.body);
+    pipeline(src, tap, res, (err) => {
+      observer.end();
+      req.socket.off('close', chain.abort);
+      res.off('close', onResponseClose);
+      ACTIVE.delete(id);
+      const error = err?.message || observer.error || (!observer.done && !observer.finished ? '流式响应提前结束' : null);
+      record(modelId, {
+        id, startedAt, provider: observer.provider, canonical: observer.canonical,
+        ...observer.metrics(), stream: true, status: error ? 502 : 200, error,
+        account: acc.name, trace: chain.trace, attempts: chain.trace.map((t) => t.upstream || 'auto'),
+      });
+      if (err) {
+        // 响应头已发出，无法再回错误 JSON；尽力收尾并记录（客户端断开属正常情况，不刷屏）
+        try { if (!res.writableEnded) res.end(); } catch {}
+        if (!req.destroyed) console.warn(`[流式中断] ${modelId}: ${err.message}`);
+      }
+    });
     return;
   }
 
   const { status, out, routing, acc } = chain;
-  if (!out) return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
+  ACTIVE.delete(id);
+  if (!out) {
+    record(modelId, { id, startedAt, status: 502, ms: Date.now() - startedAt, stream: isStream, trace: chain.trace, error: 'no upstream response', ...normalizeUsage(null) });
+    return sendJSON(res, 502, { error: { message: 'no upstream response', type: 'upstream_error' } });
+  }
   // 客户端实际使用成功的新订阅模型自动收录进列表
   if (status === 200 && /^cline-pass\//.test(String(modelId)) && !config.knownModels.includes(modelId)) {
     config.knownModels.push(modelId);
     saveConfig();
   }
+  const usage = normalizeUsage(out?.usage);
   record(modelId, {
+    id, startedAt, status,
+    ...usage,
+    endToEndTps: usage.outputTokens !== null ? usage.outputTokens / Math.max((Date.now() - startedAt) / 1000, 0.001) : null,
     provider: routing.finalProvider || null,
     canonical: routing.canonicalSlug || null,
     ms: Date.now() - chain.t0,
-    stream: false,
+    stream: isStream,
     attempts: chain.trace.map((t) => t.upstream || 'auto'),
     trace: chain.trace,
-    error: status !== 200 ? out?.error?.message || null : null,
+    error: status !== 200 ? out?.error?.message || `HTTP ${status}` : null,
     account: acc ? acc.name : null,
   });
   res.writeHead(status, {
@@ -737,6 +819,7 @@ async function handleChat(req, res) {
     'X-Cline-Canonical-Model': routing.canonicalSlug || '',
     'X-Cline-Attempts': String(chain.trace.length),
     'X-Cline-Account': headerSafe(acc ? acc.name : ''),
+    'X-Request-Id': id,
   });
   res.end(JSON.stringify(out));
 }
@@ -747,11 +830,24 @@ function sendJSON(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+function liveSnapshot() {
+  return {
+    now: Date.now(), latestMeasured: LAST_MEASURED,
+    active: [...ACTIVE.values()].map(({ observer, ...item }) => ({
+      ...item,
+      ...(observer ? { ...observer.metrics(), tps: observer.liveTps, provider: observer.provider } : { ms: Date.now() - item.startedAt }),
+    })),
+  };
+}
+
 async function catalog() {
   if (META.catalog && Date.now() - (META.catalogFetchedAt || 0) < 3600e3) return META.catalog;
-  const { json } = await fetchJSON(`${config.upstreamBase}/models`, { headers: chatHeaders(pickAccount().key) });
-  const ids = (json?.data || []).map((m) => m.id);
-  if (ids.length) { META.catalog = ids; META.catalogFetchedAt = Date.now(); saveMeta(); }
+  if (!isConfigured()) return META.catalog || [];
+  try {
+    const { json } = await fetchJSON(`${config.upstreamBase}/models`, { headers: chatHeaders(pickAccount().key) }, 10000);
+    const ids = (json?.data || []).map((m) => m.id);
+    if (ids.length) { META.catalog = ids; META.catalogFetchedAt = Date.now(); saveMeta(); }
+  } catch { /* 公开目录不可达时，配置与订阅模型仍然可用。 */ }
   return META.catalog || [];
 }
 
@@ -768,7 +864,7 @@ const server = http.createServer(async (req, res) => {
   }
   try {
     if (req.method === 'GET' && p === '/api/meta') {
-      return sendJSON(res, 200, { authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(), configured: isConfigured() });
+      return sendJSON(res, 200, { authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(req), configured: isConfigured() });
     }
     if (p.startsWith('/api/') || p.startsWith('/v1/') || CHAT_PATHS.has(p)) {
       if (!authOK(req)) return unauthorized(res);
@@ -777,10 +873,56 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(fs.readFileSync(path.join(PUBLIC_DIR, 'index.html')));
     }
+    if (req.method === 'GET' && ['/styles.css', '/management.js', '/analytics.js', '/dashboard.js'].includes(p)) {
+      res.writeHead(200, { 'Content-Type': p.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8', 'Cache-Control': 'no-cache' });
+      return res.end(fs.readFileSync(path.join(PUBLIC_DIR, p.slice(1))));
+    }
+    if (req.method === 'GET' && p === '/api/telemetry') {
+      const version = META.history[0]?.id || META.history[0]?.ts || 'empty';
+      const changed = url.searchParams.get('version') !== String(version);
+      return sendJSON(res, 200, {
+        version, ...liveSnapshot(), priceCatalog: modelPrices.status(), retention: { history: 2000, days: 366, hours: 32 * 24 },
+        ...(changed ? { analytics: META.analytics, recent: META.history.slice(0, 8) } : {}),
+      });
+    }
+    if (req.method === 'GET' && p === '/api/live') return sendJSON(res, 200, liveSnapshot());
     if (req.method === 'GET' && p === '/api/models') {
       const cat = await catalog();
       const sub = config.knownModels.map((id) => ({ id, config: config.perModel[id] || {}, meta: META.models[id] || null }));
-      return sendJSON(res, 200, { subscription: sub, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(), officialFetch: META.officialModelsFetch || null });
+      return sendJSON(res, 200, { subscription: sub, catalogCount: cat.length, catalog: cat, proxyBase: publicProxyBase(req), officialFetch: META.officialModelsFetch || null });
+    }
+    if (req.method === 'GET' && p === '/api/pricing') {
+      void modelPrices.refresh();
+      const models = [...new Set([...config.knownModels, ...Object.keys(config.pricing || {}), ...Object.keys(config.pricingSources || {})])];
+      const catalog = Object.fromEntries(models.map(model => {
+        const meta = META.models[model] || {};
+        const entry = { model, canonical: meta.canonical || meta.canonicalSlug, provider: meta.provider || meta.lastProvider };
+        return [model, { candidates: modelPrices.candidates(model, entry.canonical), resolved: modelPrices.lookup(entry, config.pricingSources?.[model]), actualProvider: entry.provider || null }];
+      }));
+      return sendJSON(res, 200, { pricing: config.pricing || {}, selections: config.pricingSources || {}, models, catalog, status: modelPrices.status() });
+    }
+    if (req.method === 'POST' && p === '/api/pricing/sync') {
+      const result = await modelPrices.refresh(true);
+      return sendJSON(res, 200, { ok: !result.error, status: result });
+    }
+    if (req.method === 'POST' && p === '/api/pricing') {
+      const body = JSON.parse((await readBody(req)).toString('utf8'));
+      let pricing;
+      try { pricing = normalizePricing(body.pricing); }
+      catch (e) { return sendJSON(res, 400, { error: { message: e.message } }); }
+      const selections = body.selections ?? config.pricingSources ?? {};
+      if (!selections || typeof selections !== 'object' || Array.isArray(selections)) return sendJSON(res, 400, { error: { message: '价格来源配置无效' } });
+      const sources = {};
+      for (const [model, sourceKey] of Object.entries(selections)) {
+        if (['__proto__', 'constructor', 'prototype'].includes(model) || typeof sourceKey !== 'string') return sendJSON(res, 400, { error: { message: '价格来源配置无效' } });
+        const meta = META.models[model] || {};
+        if (sourceKey !== config.pricingSources?.[model] && !modelPrices.candidates(model, meta.canonical || meta.canonicalSlug).some(candidate => candidate.key === sourceKey)) return sendJSON(res, 400, { error: { message: `${model} 的 models.dev 来源已不可用，请重新选择` } });
+        sources[model] = sourceKey;
+      }
+      config.pricing = pricing;
+      config.pricingSources = sources;
+      saveConfig();
+      return sendJSON(res, 200, { ok: true, pricing, selections: sources });
     }
     if (req.method === 'POST' && p === '/api/probe') {
       const { model } = await JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -801,13 +943,14 @@ const server = http.createServer(async (req, res) => {
       const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
       const trace = chain.trace || [];
       if (chain.status !== 200) {
+        record(model, { status: chain.status, startedAt: t0, ms: Date.now() - t0, stream: false, trace, error: chain.out?.error?.message || 'upstream error', account: chain.acc?.name || null, ...normalizeUsage(chain.out?.usage) });
         return sendJSON(res, 200, {
           ok: false, error: (chain.out?.error?.message || 'upstream error').slice?.(0, 400) || 'upstream error',
           targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], trace,
         });
       }
       const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null });
+      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, status: 200, ...normalizeUsage(chain.out?.usage), trace, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null });
       return sendJSON(res, 200, {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
@@ -873,7 +1016,7 @@ const server = http.createServer(async (req, res) => {
       if (body.exposeCatalog !== undefined) config.exposeCatalog = !!body.exposeCatalog;
       saveConfig();
       PROXY_KEY = config.proxyKey || '';
-      return sendJSON(res, 200, { ok: true, proxyKey: config.proxyKey, publicBaseUrl: config.publicBaseUrl, authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(), exposeCatalog: !!config.exposeCatalog });
+      return sendJSON(res, 200, { ok: true, proxyKey: config.proxyKey, publicBaseUrl: config.publicBaseUrl, authRequired: !!PROXY_KEY, proxyBase: publicProxyBase(req), exposeCatalog: !!config.exposeCatalog });
     }
     if (req.method === 'POST' && p === '/api/validate-upstreams') {
       const { model } = JSON.parse(await readBody(req).then((b) => b.toString()));
@@ -888,7 +1031,7 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true, ...r });
     }
     if (req.method === 'GET' && p === '/api/history') return sendJSON(res, 200, { history: META.history });
-    if (req.method === 'GET' && p === '/api/config') return sendJSON(res, 200, { port: config.port, perModel: config.perModel, knownModels: config.knownModels });
+    if (req.method === 'GET' && p === '/api/config') return sendJSON(res, 200, { port: config.port, extraPorts: config.extraPorts || [], perModel: config.perModel, knownModels: config.knownModels });
     if (req.method === 'POST' && p === '/api/config') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
       if (body.perModel) {
@@ -918,7 +1061,7 @@ const server = http.createServer(async (req, res) => {
         : [...new Set([...config.knownModels, ...Object.keys(config.perModel)])];
       return sendJSON(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model' })) });
     }
-    if (CHAT_PATHS.has(p) && req.method === 'POST') return handleChat(req, res);
+    if (CHAT_PATHS.has(p) && req.method === 'POST') return await handleChat(req, res);
     return sendJSON(res, 404, { error: { message: `no route: ${req.method} ${p}` } });
   } catch (e) {
     return sendJSON(res, 500, { error: { message: e.message } });
@@ -928,13 +1071,32 @@ const server = http.createServer(async (req, res) => {
 // HTTP 响应头只允许 Latin-1，账号名里的中文等字符需要清洗（历史/统计仍用原名）
 const headerSafe = (s) => String(s ?? '').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 80) || '-';
 
-server.on('error', (e) => {
-  console.error(`[错误] 端口 ${config.port} 监听失败（可能被占用）：${e.message}`);
-  process.exit(1);
-});
-
 const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
-server.listen(config.port, BIND_HOST, () => {
-  console.log(`Cline Pass 上游控制台:  http://127.0.0.1:${config.port}/`);
-  console.log(`OpenAI 兼容代理地址:   http://127.0.0.1:${config.port}/v1`);
-});
+
+// 固定备用端口与主端口共享状态；Windows 端口被系统预留时仍可使用备用地址。
+const extraPorts = [...new Set((config.extraPorts || [])
+  .map((p) => Number(p))
+  .filter((p) => Number.isInteger(p) && p > 0 && p < 65536 && p !== config.port))];
+const requestHandler = (req, res) => server.emit('request', req, res);
+let pendingListeners = 1 + extraPorts.length;
+let listeningCount = 0;
+function settled() {
+  if (--pendingListeners === 0 && listeningCount === 0) {
+    console.error('[错误] 所有监听端口均不可用，服务未启动。');
+    process.exit(1);
+  }
+}
+for (const [index, port] of [config.port, ...extraPorts].entries()) {
+  const listener = index === 0 ? server : http.createServer(requestHandler);
+  listener.once('error', (error) => {
+    console.warn(`[告警] 端口 ${port} 监听失败（${error.code}）：${error.message}`);
+    settled();
+  });
+  listener.listen(port, BIND_HOST, () => {
+    listeningCount++;
+    console.log(`Cline Pass 控制台: http://127.0.0.1:${port}/`);
+    console.log(`OpenAI 兼容代理:  http://127.0.0.1:${port}/v1`);
+    settled();
+  });
+}
+void modelPrices.refresh();
