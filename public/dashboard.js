@@ -11,8 +11,11 @@
   const time = (ts) => new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
   const shortModel = (value) => String(value || '').replace(/^cline-pass\//, '');
   const failed = (r) => !!r.error || r.status >= 400;
-  const dateKey = (ts) => new Date(ts).toISOString().slice(0, 10);
   const A = globalThis.CPSAnalytics;
+  const dateKey = A.dateKey;
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const zoneLabel = `${timeZone}（本地时间）`;
+  el('#usageRange option[value="today"]').textContent = '当天 · 本地时间';
   const storedSize = Number(localStorage.getItem('cps_page_size'));
   const state = { range: 'today', filters: { provider: '', model: '' }, trend: 'tokens', summary: 'requests', groupPage: 1, overviewPage: 1, pageSize: [25,50,100,200].includes(storedSize) ? storedSize : 50, pricing: {}, pricingLoaded: false, version: '', analytics: { days: {}, hours: {} }, recent: [], history: [], historyVersion: '', historyLoaded: false, active: [], latestMeasured: null, liveNow: 0, now: Date.now(), page: 1, sort: 'time', descending: true, view: 'overview', renderedHour: null };
   let polling = false;
@@ -39,7 +42,7 @@
     if (polling || el('#loginOverlay').style.display === 'flex') return;
     polling = true;
     try {
-      const data = await read(`/api/telemetry?version=${encodeURIComponent(state.version)}`);
+      const data = await read(`/api/telemetry?timeZone=${encodeURIComponent(timeZone)}&version=${encodeURIComponent(state.version)}`);
       const changed = state.version !== String(data.version);
       state.version = String(data.version);
       state.now = data.now;
@@ -55,8 +58,8 @@
       delete document.body.dataset.offline;
       text('#connectionLabel', '代理已连接');
       text('#syncLabel', `已同步 ${new Date(data.now).toLocaleTimeString('zh-CN', { hour12: false })}`);
-      if (changed || state.renderedHour !== Math.floor(data.now / 3600000) || el('#metrics').getAttribute('aria-busy') === 'true') {
-        state.renderedHour = Math.floor(data.now / 3600000);
+      if (changed || state.renderedHour !== A.hourKey(data.now) || el('#metrics').getAttribute('aria-busy') === 'true') {
+        state.renderedHour = A.hourKey(data.now);
         renderUsageFilters();
         renderOverview();
         renderRecent();
@@ -131,13 +134,14 @@
     text('#reasoningTotal', totals.reasoningRequests ? compact(totals.reasoningTokens) : '—');
     el('#reasoningTotal').title = totals.reasoningRequests ? `${number(totals.reasoningTokens)} Token` : '上游未上报';
     text('#reasoningNote', `${number(totals.reasoningRequests)} 次请求已上报 · 输出的子集`);
-    text('#rangeLabel', state.range === 'today' ? '当天 · UTC' : Number(state.range) === 1 ? '最近 24 小时' : `最近 ${state.range} 天`);
+    text('#rangeLabel', state.range === 'today' ? '当天 · 本地时间' : Number(state.range) === 1 ? '最近 24 小时' : `最近 ${state.range} 天`);
     const original = A.range(state.analytics, state.range, state.now);
     const originalTotal = A.sum(original).requests;
     const groupedTotal = A.sum(original.flatMap(b => Object.values(b.segments || {}))).requests;
     const incomplete = groupedTotal < originalTotal;
-    el('#coverageNote').hidden = !incomplete || !['overview', 'requests'].includes(state.view);
-    text('#coverageNote', `旧数据的模型／上游分组可追溯 ${number(groupedTotal)} / ${number(originalTotal)} 次请求。筛选与分组仅统计可追溯记录，未筛选总览保留完整原始聚合。`);
+    const legacy = state.analytics.legacyRequests || 0;
+    el('#coverageNote').hidden = !(incomplete || legacy) || !['overview', 'requests'].includes(state.view);
+    text('#coverageNote', [legacy ? `旧版聚合中 ${number(legacy)} 条请求的详细记录已过期，无法按当前时区重新归档，未计入本地统计；原始聚合仍保留。` : '', incomplete ? `旧数据的模型／上游分组可追溯 ${number(groupedTotal)} / ${number(originalTotal)} 次请求。筛选与分组仅统计可追溯记录。` : ''].filter(Boolean).join(' '));
     if (state.version) el('#metrics').setAttribute('aria-busy', 'false');
     renderTrend(buckets, totals);
     renderHeatmap();
@@ -154,7 +158,7 @@
     }[state.trend];
     const hourly = state.range === 'today' || Number(state.range) === 1;
     text('#trendTitle', `使用趋势 · ${settings.label}`);
-    text('#trendSubtitle', `${hourly ? '按小时' : '按天'}聚合 · UTC · ${settings.unit}${state.trend === 'cost' ? ' · 仅计有成本数据的请求' : ''}`);
+    text('#trendSubtitle', `${hourly ? '按小时' : '按天'}聚合 · ${zoneLabel} · ${settings.unit}${state.trend === 'cost' ? ' · 仅计有成本数据的请求' : ''}`);
     el('#trendLegend').innerHTML = settings.labels.map((label, i) => `<span><i class="legend-dot ${i ? 'output' : 'input'}"></i>${label}</span>`).join('');
     if (!settings.known) {
       node.innerHTML = `<div class="chart-empty"><strong>此范围尚无${settings.label}数据</strong><span>${state.trend === 'cost' ? '上游上报成本或配置模型定价后，新请求将记录参考成本。' : '可调整筛选，或通过代理发起请求后查看。'}</span></div>`;
@@ -163,12 +167,12 @@
     const max = Math.max(0, ...buckets.flatMap(b => settings.fields.map(field => b[field] || 0)));
     const top = state.trend === 'cost' ? max * 1.15 || .01 : Math.max(4, Math.ceil(max / 4) * 4);
     const display = value => state.trend === 'cost' ? money(value) : compact(value);
-    const label = b => hourly ? `${new Date(b.ts).getUTCHours().toString().padStart(2, '0')}:00` : b.key.slice(5).replace('-', '/');
+    const label = b => hourly ? `${new Date(b.ts).getHours().toString().padStart(2, '0')}:${new Date(b.ts).getMinutes().toString().padStart(2, '0')}` : b.key.slice(5).replace('-', '/');
     node.innerHTML = `<div class="bar-chart" role="group" aria-label="${hourly ? '每小时' : '每天'}${settings.label}，聚焦柱状图查看精确值">
       <div class="chart-scale">${[1, .75, .5, .25, 0].map(ratio => `<span>${display(top * ratio)}</span>`).join('')}</div>
       <div class="bars">${buckets.map((b, i) => {
         const hasData = state.trend === 'cost' ? b.costRequests : state.trend === 'cache' ? b.cacheReadRequests || b.cacheWriteRequests : state.trend === 'tokens' ? b.usageRequests : true;
-        const title = `${b.key.replace('T', ' ')} UTC · ${!hasData ? '未上报' : settings.fields.map((field, index) => `${settings.labels[index]} ${state.trend === 'cost' ? money(b[field] || 0) : number(b[field] || 0)}`).join(' · ')} · ${number(b.requests || 0)} 次请求`;
+        const title = `${hourly ? A.isoTimestamp(b.ts) : b.key} · ${zoneLabel} · ${!hasData ? '未上报' : settings.fields.map((field, index) => `${settings.labels[index]} ${state.trend === 'cost' ? money(b[field] || 0) : number(b[field] || 0)}`).join(' · ')} · ${number(b.requests || 0)} 次请求`;
         return `<button class="bar-slot" data-bar="${i}" title="${escape(title)}" aria-label="${escape(title)}">${settings.fields.map((field, index) => `<span class="bar ${index ? 'output' : 'input'}" style="height:${(b[field] || 0) / top * 100}%"></span>`).join('')}</button>`;
       }).join('')}</div><div class="chart-ticks">${[...new Set([0, Math.floor((buckets.length - 1) / 3), Math.floor((buckets.length - 1) * 2 / 3), buckets.length - 1])].map(i => `<span>${label(buckets[i])}</span>`).join('')}</div></div><div class="chart-readout" hidden></div>`;
     node.querySelectorAll('[data-bar]').forEach(button => {
@@ -184,14 +188,14 @@
   function renderHeatmap() {
     const metric = el('#heatMetric').value;
     const metricLabel = { requests: '次请求', totalTokens: 'Token', errors: '次错误', cachedTokens: '缓存读取 Token', cacheWriteTokens: '缓存写入 Token' }[metric];
-    const today = Date.parse(`${dateKey(state.now)}T00:00:00Z`);
+    const today = A.startOfDay(state.now);
     const weeks = innerWidth <= 700 ? 13 : innerWidth <= 1200 ? 26 : 53;
     el('#heatmap').style.setProperty('--heat-weeks', weeks);
-    text('#heatmapSubtitle', `${weeks === 53 ? '近一年' : `最近 ${weeks} 周`} · 点击日期追踪当日请求 · UTC`);
-    const end = today + (6 - new Date(today).getUTCDay()) * 86400000;
-    const start = end - (weeks * 7 - 1) * 86400000;
+    text('#heatmapSubtitle', `${weeks === 53 ? '近一年' : `最近 ${weeks} 周`} · 点击日期追踪当日请求 · ${zoneLabel}`);
+    const end = A.addDays(today, 6 - new Date(today).getDay());
+    const start = A.addDays(end, -(weeks * 7 - 1));
     const days = Array.from({ length: weeks * 7 }, (_, i) => {
-      const ts = start + i * 86400000;
+      const ts = A.addDays(start, i);
       const key = dateKey(ts);
       const bucket = A.select(state.analytics.days[key] || {}, state.filters);
       return { ts, key, value: bucket[metric] || 0, bucket };
@@ -199,12 +203,12 @@
     const max = Math.max(1, ...days.map(d => d.value));
     let lastMonth = '';
     const months = days.filter((_, i) => i % 7 === 0).map(d => {
-      const month = `${new Date(d.ts).getUTCMonth() + 1} 月`;
+      const month = `${new Date(d.ts).getMonth() + 1} 月`;
       const output = month === lastMonth ? '' : month;
       lastMonth = month;
       return `<span>${output}</span>`;
     }).join('');
-    el('#heatmap').innerHTML = `<div class="heat-months" aria-hidden="true"><span></span>${months}</div><div class="heat-body"><div class="heat-days" aria-hidden="true"><span></span><span>一</span><span></span><span>三</span><span></span><span>五</span><span></span></div><div class="heat-grid" role="group" aria-label="${weeks} 周调用热力图，日期以 UTC 计">${days.map(d => {
+    el('#heatmap').innerHTML = `<div class="heat-months" aria-hidden="true"><span></span>${months}</div><div class="heat-body"><div class="heat-days" aria-hidden="true"><span></span><span>一</span><span></span><span>三</span><span></span><span>五</span><span></span></div><div class="heat-grid" role="group" aria-label="${weeks} 周调用热力图，${escape(zoneLabel)}">${days.map(d => {
       const level = !d.value ? 0 : Math.max(1, Math.ceil(Math.sqrt(d.value / max) * 4));
       const missing = metric === 'cachedTokens' ? !d.bucket.cacheReadRequests : metric === 'cacheWriteTokens' ? !d.bucket.cacheWriteRequests : metric === 'totalTokens' ? !d.bucket.usageRequests : false;
       const label = missing ? `${d.key} · ${metricLabel}未上报` : `${d.key} · ${number(d.value)} ${metricLabel}`;
@@ -217,7 +221,7 @@
     el('#heatmap').querySelectorAll('[data-day]').forEach(button => {
       const detail = () => {
         const b = A.select(state.analytics.days[button.dataset.day] || {}, state.filters);
-        text('#heatDetail', `${button.dataset.day} UTC · ${number(b.requests || 0)} 次请求 · ${b.usageRequests ? number(b.totalTokens) + ' Token' : 'Token 未上报'} · 缓存读取 ${b.cacheReadRequests ? number(b.cachedTokens) : '—'} / 写入 ${b.cacheWriteRequests ? number(b.cacheWriteTokens) : '—'} Token · ${number(b.errors || 0)} 次错误`);
+        text('#heatDetail', `${button.dataset.day} · ${zoneLabel} · ${number(b.requests || 0)} 次请求 · ${b.usageRequests ? number(b.totalTokens) + ' Token' : 'Token 未上报'} · 缓存读取 ${b.cacheReadRequests ? number(b.cachedTokens) : '—'} / 写入 ${b.cacheWriteRequests ? number(b.cacheWriteTokens) : '—'} Token · ${number(b.errors || 0)} 次错误`);
       };
       button.addEventListener('pointerenter', detail);
       button.addEventListener('focus', detail);
@@ -542,7 +546,7 @@
       const rows = filteredRequests(state.view === 'overview');
       const columns = ['id', 'ts', 'model', 'account', 'provider', 'canonical', 'status', 'inputTokens', 'outputTokens', 'totalTokens', 'cachedTokens', 'cacheWriteTokens', 'reasoningTokens', 'costUsd', 'costSource', 'pricingSource', 'pricingProvider', 'pricingModel', 'pricingFetchedAt', 'tps', 'endToEndTps', 'ttftMs', 'generationMs', 'ms', 'stream', 'error'];
       const pricingFields = { pricingSource:'source', pricingProvider:'provider', pricingModel:'model', pricingFetchedAt:'fetchedAt' };
-      const csv = '\uFEFF' + [columns.map(csvCell).join(','), ...rows.map(r => columns.map(c => csvCell(c === 'ts' ? new Date(r.ts).toISOString() : pricingFields[c] ? r.costPricing?.[pricingFields[c]] : r[c])).join(','))].join('\r\n');
+      const csv = '\uFEFF' + [columns.map(csvCell).join(','), ...rows.map(r => columns.map(c => csvCell(c === 'ts' ? A.isoTimestamp(r.ts) : pricingFields[c] ? r.costPricing?.[pricingFields[c]] : r[c])).join(','))].join('\r\n');
       const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
       const link = document.createElement('a'); link.href = url; link.download = `cline-pass-requests-${dateKey(state.now)}.csv`; link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -632,7 +636,7 @@
     updateThemeButton();
   });
   el('#sourceButton').addEventListener('click', () => {
-    el('#sourceDetail').innerHTML = `<dl class="detail-grid"><div class="wide"><dt>数据来源</dt><dd>经本代理处理的真实请求与上游 usage；不读取其他应用的会话日志。</dd></div><div><dt>详细日志</dt><dd>最近 2,000 条</dd></div><div><dt>聚合留存</dt><dd>按日 366 天 / 按小时 32 天</dd></div><div><dt>当前同步</dt><dd>${escape(time(state.now))}</dd></div><div><dt>统计时区</dt><dd>UTC；日志显示本地时间</dd></div><div class="wide"><dt>参考成本</dt><dd>优先使用上游 usage.cost（USD），其次手动定价，再匹配 models.dev 供应商报价。估算保存请求发生时的单价与来源；报价不等于订阅扣费，无法完整估算时显示 —。</dd></div><div class="wide"><dt>缓存口径</dt><dd>读取和写入已计入完整输入，推理已计入输出。命中占比按同批已上报缓存明细的输入 Token 加权。</dd></div><div class="wide"><dt>统计完整性</dt><dd>未筛选总览沿用历史聚合；旧版本丢弃的请求无法补回模型／上游维度。分组覆盖不足时页面会标明。</dd></div></dl>`;
+    el('#sourceDetail').innerHTML = `<dl class="detail-grid"><div class="wide"><dt>数据来源</dt><dd>经本代理处理的真实请求与上游 usage；不读取其他应用的会话日志。</dd></div><div><dt>详细日志</dt><dd>最近 2,000 条</dd></div><div><dt>聚合留存</dt><dd>按日 366 天 / 按小时 32 天</dd></div><div><dt>当前同步</dt><dd>${escape(time(state.now))}</dd></div><div><dt>统计时区</dt><dd>${escape(zoneLabel)}</dd></div><div class="wide"><dt>参考成本</dt><dd>优先使用上游 usage.cost（USD），其次手动定价，再匹配 models.dev 供应商报价。估算保存请求发生时的单价与来源；报价不等于订阅扣费，无法完整估算时显示 —。</dd></div><div class="wide"><dt>缓存口径</dt><dd>读取和写入已计入完整输入，推理已计入输出。命中占比按同批已上报缓存明细的输入 Token 加权。</dd></div><div class="wide"><dt>统计完整性</dt><dd>按浏览器时区归档；旧版聚合中已过期的详细请求无法重新归档，缺失数量会在页面标明。</dd></div></dl>`;
     el('#sourceDialog').showModal();
   });
   el('#requestDialog').addEventListener('click', event => { if (event.target === el('#requestDialog') && (event.offsetX < 0 || event.offsetX > event.target.clientWidth || event.offsetY < 0 || event.offsetY > event.target.clientHeight)) event.target.close(); });

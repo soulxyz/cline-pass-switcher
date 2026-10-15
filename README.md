@@ -4,7 +4,7 @@ Cline Pass 的本地代理和网页控制台。管理账号、选择上游渠道
 
 Node.js ≥ 18，无第三方运行依赖，无需构建。
 
-![用量总览](docs/screenshot-top.png)
+![用量总览](docs/screenshot-top.jpg)
 
 <details>
 <summary>请求追踪与深色主题</summary>
@@ -41,7 +41,7 @@ Model:    从控制台订阅模型列表中选择
 - **请求追踪**：按模型、上游、状态和日期筛选，查看重试路径，分页浏览或导出 CSV。
 - **参考定价**：优先读取上游成本，也可使用手动单价或 models.dev 报价估算。保留请求发生时的单价和来源。
 
-Token 只采用上游上报的 `usage`，缺失时显示 `—`。参考成本不等于 Cline Pass 订阅扣费。详细计算方式见 [统计口径](docs/metrics.md)。
+Token 只采用上游上报的 `usage`，缺失时显示 `—`。参考成本不等于 Cline Pass 订阅扣费。统计日期跟随浏览器所在时区。详细计算方式见 [统计口径](docs/metrics.md)。
 
 ## Docker
 

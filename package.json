@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/smoke.mjs && node tests/listeners.mjs",
+    "test": "node tests/smoke.mjs && node tests/listeners.mjs && node tests/timezones.mjs",
     "check": "node --check server.js && node --check lib/telemetry.js && node --check lib/costs.js && node --check lib/models-dev.js && node --check public/management.js && node --check public/analytics.js && node --check public/dashboard.js"
   }
 }

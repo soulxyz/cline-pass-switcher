@@ -97,6 +97,19 @@ if (META.analytics.detailVersion !== 1) {
   }
   META.analytics.detailVersion = 1;
 }
+META.analyticsByTimeZone ||= {};
+function analyticsForTimeZone(timeZone) {
+  if (!META.analyticsByTimeZone[timeZone]) {
+    const analytics = { since: Date.now(), days: {}, hours: {}, timeZone };
+    for (const entry of [...META.history].reverse()) addAggregate(analytics, entry, timeZone);
+    const originalCount = Object.values(META.analytics.days).reduce((sum, day) => sum + (day.requests || 0), 0);
+    const restoredCount = Object.values(analytics.days).reduce((sum, day) => sum + (day.requests || 0), 0);
+    analytics.legacyRequests = Math.max(0, originalCount - restoredCount);
+    META.analyticsByTimeZone[timeZone] = analytics;
+    saveMeta();
+  }
+  return META.analyticsByTimeZone[timeZone];
+}
 // 旧版单 apiKey 迁移为账号池
 if ((!Array.isArray(config.accounts) || config.accounts.length === 0) && config.apiKey) {
   config.accounts = [{ name: '默认账号', key: config.apiKey, enabled: true }];
@@ -466,6 +479,7 @@ function record(modelId, info) {
   }
   if (META.history.length > 2000) META.history.length = 2000;
   addAggregate(META.analytics, entry);
+  for (const [timeZone, analytics] of Object.entries(META.analyticsByTimeZone)) addAggregate(analytics, entry, timeZone);
   if (info.account) {
     META.stats = META.stats || {};
     const st = (META.stats[info.account] ||= { requests: 0, lastUsed: 0, lastError: null });
@@ -878,11 +892,18 @@ const server = http.createServer(async (req, res) => {
       return res.end(fs.readFileSync(path.join(PUBLIC_DIR, p.slice(1))));
     }
     if (req.method === 'GET' && p === '/api/telemetry') {
-      const version = META.history[0]?.id || META.history[0]?.ts || 'empty';
+      let timeZone = null;
+      if (url.searchParams.has('timeZone')) {
+        try { timeZone = new Intl.DateTimeFormat('en', { timeZone: url.searchParams.get('timeZone') }).resolvedOptions().timeZone; }
+        catch { return sendJSON(res, 400, { error: { message: '无效时区' } }); }
+      }
+      const analytics = timeZone ? analyticsForTimeZone(timeZone) : META.analytics;
+      const historyVersion = META.history[0]?.id || META.history[0]?.ts || 'empty';
+      const version = timeZone ? `${timeZone}:${historyVersion}` : historyVersion;
       const changed = url.searchParams.get('version') !== String(version);
       return sendJSON(res, 200, {
         version, ...liveSnapshot(), priceCatalog: modelPrices.status(), retention: { history: 2000, days: 366, hours: 32 * 24 },
-        ...(changed ? { analytics: META.analytics, recent: META.history.slice(0, 8) } : {}),
+        ...(changed ? { analytics, recent: META.history.slice(0, 8) } : {}),
       });
     }
     if (req.method === 'GET' && p === '/api/live') return sendJSON(res, 200, liveSnapshot());

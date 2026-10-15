@@ -111,6 +111,12 @@ try {
   const day = Object.values(telemetry.analytics.days)[0];
   assert.equal(day.requests, 3); assert.equal(day.errors, 1); assert.equal(day.totalTokens, 40);
   assert.equal(day.costRequests,2); assert.ok(Math.abs(day.costUsd - .040028) < 1e-10);
+  const localized = await (await fetch(base + '/api/telemetry?timeZone=Asia%2FKathmandu')).json();
+  assert.equal(Object.values(localized.analytics.days).reduce((sum,day)=>sum+day.requests,0),3);
+  assert.equal(localized.analytics.legacyRequests,0);
+  const localCached = await (await fetch(base + '/api/telemetry?timeZone=Asia%2FKathmandu&version=' + encodeURIComponent(localized.version))).json();
+  assert.equal('analytics' in localCached,false);
+  assert.equal((await fetch(base + '/api/telemetry?timeZone=invalid-zone')).status,400);
 
   const liveResponse = await call({ stream: true, live_probe: true });
   const liveText = liveResponse.text();
@@ -128,6 +134,10 @@ try {
   assert.equal(afterInterrupt.active.length,0);
   assert.equal(afterInterrupt.recent[0].status,502);
   assert.equal((await call({stream:false})).status,200);
+  const updatedLocal = await (await fetch(base + '/api/telemetry?timeZone=Asia%2FKathmandu')).json();
+  assert.equal(Object.values(updatedLocal.analytics.days).reduce((sum,day)=>sum+day.requests,0),6);
+  const persisted = JSON.parse(fs.readFileSync(path.join(temp,'metadata.json'),'utf8'));
+  assert.ok(persisted.analyticsByTimeZone[updatedLocal.analytics.timeZone]);
   assert.equal(normalizeUsage({input_tokens:10,cache_read_input_tokens:80,cache_creation_input_tokens:10,output_tokens:20}).inputTokens,100);
   assert.equal(normalizeUsage({prompt_tokens:100,prompt_tokens_details:{cached_tokens:80},completion_tokens:20}).inputTokens,100);
   assert.equal(normalizeUsage({cost:0,cost_currency:'EUR'}).costUsd,null);
